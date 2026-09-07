@@ -44,3 +44,6 @@ docker build --build-arg MM_VERSION=11.5.0 -t mattermost-arm64:11.5.0 .
 ```yaml
 image: ghcr.io/antonsatt/mattermost-arm64:11.5.0
 ```
+
+
+Anton :) 
