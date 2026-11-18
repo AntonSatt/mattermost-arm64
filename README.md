@@ -26,12 +26,15 @@ docker pull ghcr.io/antonsatt/mattermost-arm64:11.5.0
 
 A GitHub Actions workflow runs weekly (every Monday) and:
 
-1. Checks the latest Mattermost release version
-2. Skips if the image already exists in GHCR
-3. Verifies the official ARM64 tarball is available
-4. Builds and pushes to GitHub Container Registry
+1. Finds the highest stable Mattermost release by version number (not GitHub's "latest" flag, which often points at a patch on an older line)
+2. Also finds the newest patch within the major version my own cluster runs, so a deployment that stays on an older major still gets its security patches
+3. Skips any version whose image already exists in GHCR
+4. Verifies the official ARM64 tarball is available
+5. Builds and pushes to GitHub Container Registry, and points `:latest` at the highest release
+6. Bumps my cluster's manifest to the newest patch within its major (major upgrades stay manual)
+7. Re-enables itself through the API, because GitHub disables scheduled workflows after 60 days without commits
 
-You can also trigger a build manually from the Actions tab.
+You can also trigger a build manually from the Actions tab, with an optional `mm_version`.
 
 ## Building locally
 
