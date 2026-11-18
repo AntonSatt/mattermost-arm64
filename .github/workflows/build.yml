@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mm_version:
-        description: "Mattermost version to build (e.g. 11.5.0)"
+        description: "Version to build and deploy (e.g. 11.11.4). Empty = same as the weekly run."
         required: false
 
 jobs:
@@ -15,79 +15,109 @@ jobs:
     permissions:
       contents: read
       packages: write
+      actions: write # keepalive step re-enables this workflow
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Get latest Mattermost version
+      - name: Pick versions
         id: version
-        run: |
-          if [ -n "${{ github.event.inputs.mm_version }}" ]; then
-            VERSION="${{ github.event.inputs.mm_version }}"
-          else
-            VERSION=$(curl -s https://api.github.com/repos/mattermost/mattermost/releases/latest | jq -r '.tag_name' | sed 's/^v//')
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Mattermost version: $VERSION"
-
-      - name: Check if image already exists
-        id: check
-        run: |
-          TAG="ghcr.io/${GITHUB_REPOSITORY,,}:${VERSION}"
-          if docker manifest inspect "$TAG" > /dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Image $TAG already exists, skipping build"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Image $TAG not found, will build"
-          fi
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-
-      - name: Check ARM64 tarball exists
-        if: steps.check.outputs.exists == 'false'
+          GH_TOKEN: ${{ github.token }}
+          INFRA_REPO_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
+          INPUT_VERSION: ${{ github.event.inputs.mm_version }}
         run: |
-          URL="https://releases.mattermost.com/${{ steps.version.outputs.version }}/mattermost-${{ steps.version.outputs.version }}-linux-arm64.tar.gz"
-          STATUS=$(curl -o /dev/null -s -w "%{http_code}" -L "$URL")
-          if [ "$STATUS" != "200" ]; then
-            echo "ERROR: ARM64 tarball not found at $URL (HTTP $STATUS)"
+          # Highest stable release by semver. GitHub's "latest" flag follows the
+          # newest publish date, which is often a patch on an older line.
+          RELEASES=$(gh api 'repos/mattermost/mattermost/releases?per_page=100' \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+          LATEST=$(tail -1 <<<"$RELEASES")
+
+          # The version the cluster runs, read from the infra repo manifest.
+          DEPLOYED=$(GH_TOKEN="$INFRA_REPO_TOKEN" gh api \
+            repos/AntonSatt/sort-my-infra/contents/kubernetes/apps/mattermost/deployment.yml \
+            --jq .content | base64 -d \
+            | grep -oE 'mattermost-arm64:[0-9]+\.[0-9]+\.[0-9]+' | head -1 | cut -d: -f2)
+
+          if [ -n "$INPUT_VERSION" ]; then
+            if ! grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$INPUT_VERSION"; then
+              echo "ERROR: mm_version must look like 11.11.4, got '$INPUT_VERSION'"
+              exit 1
+            fi
+            TARGET="$INPUT_VERSION"
+          else
+            # Newest patch within the major the cluster runs. Major bumps stay manual.
+            TARGET=$(grep -E "^${DEPLOYED%%.*}\." <<<"$RELEASES" | tail -1 || true)
+          fi
+
+          if [ -z "$LATEST" ] || [ -z "$DEPLOYED" ] || [ -z "$TARGET" ]; then
+            echo "ERROR: could not resolve versions (latest='$LATEST' deployed='$DEPLOYED' target='$TARGET')"
             exit 1
           fi
-          echo "ARM64 tarball available at $URL"
+
+          # The weekly run also builds the overall latest release, so the public
+          # :latest tag keeps following Mattermost even when the cluster stays on
+          # an older major.
+          BUILD="$TARGET"
+          if [ -z "$INPUT_VERSION" ] && [ "$LATEST" != "$TARGET" ]; then
+            BUILD="$TARGET $LATEST"
+          fi
+
+          {
+            echo "latest=$LATEST"
+            echo "target=$TARGET"
+            echo "build=$BUILD"
+          } >> "$GITHUB_OUTPUT"
+          echo "Latest release: $LATEST, deployed: $DEPLOYED, deploy target: $TARGET, build: $BUILD"
 
       - name: Log in to GHCR
-        if: steps.check.outputs.exists == 'false'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        if: steps.check.outputs.exists == 'false'
+      - name: Build and push missing images
+        env:
+          BUILD: ${{ steps.version.outputs.build }}
+          LATEST: ${{ steps.version.outputs.latest }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-
-          docker build \
-            --build-arg MM_VERSION="$VERSION" \
-            --tag "$IMAGE:$VERSION" \
-            --tag "$IMAGE:latest" \
-            .
-
-          docker push "$IMAGE:$VERSION"
-          docker push "$IMAGE:latest"
-
           echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Version:** $VERSION" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Image:** \`$IMAGE:$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Platform:** linux/arm64" >> "$GITHUB_STEP_SUMMARY"
+
+          for VERSION in $BUILD; do
+            if docker manifest inspect "$IMAGE:$VERSION" > /dev/null 2>&1; then
+              echo "Image $IMAGE:$VERSION already exists, skipping build"
+              echo "- $VERSION: already in GHCR" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            URL="https://releases.mattermost.com/${VERSION}/mattermost-${VERSION}-linux-arm64.tar.gz"
+            STATUS=$(curl -o /dev/null -s -w "%{http_code}" -L "$URL")
+            if [ "$STATUS" != "200" ]; then
+              echo "ERROR: ARM64 tarball not found at $URL (HTTP $STATUS)"
+              exit 1
+            fi
+
+            docker build --build-arg MM_VERSION="$VERSION" --tag "$IMAGE:$VERSION" .
+            docker push "$IMAGE:$VERSION"
+            echo "- $VERSION: built and pushed (linux/arm64)" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          # Point :latest at the highest release whenever this run covered it.
+          # Done in the registry, so it also repairs a :latest that a manual
+          # build of an older version moved.
+          if [[ " $BUILD " == *" $LATEST "* ]]; then
+            docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$LATEST"
+            echo "- latest -> $LATEST" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Bump tag in infra repo (deploy)
-        if: steps.check.outputs.exists == 'false'
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ steps.version.outputs.target }}
+          INPUT_VERSION: ${{ github.event.inputs.mm_version }}
           INFRA_REPO_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
         run: |
           git clone --depth 1 \
@@ -95,18 +125,36 @@ jobs:
           cd infra
           FILE=kubernetes/apps/mattermost/deployment.yml
           OLD=$(grep -oE 'mattermost-arm64:[0-9]+\.[0-9]+\.[0-9]+' "$FILE" | head -1 | cut -d: -f2)
-          # Safety: never auto-deploy a major bump (potentially breaking DB migrations) — do those by hand.
-          if [ "${VERSION%%.*}" != "${OLD%%.*}" ]; then
-            echo "Major version change ${OLD} -> ${VERSION}; skipping auto-bump (run manually)."
+          # Safety: never auto-deploy a major bump (potentially breaking DB
+          # migrations). Change the manifest by hand for those.
+          if [ "${TARGET%%.*}" != "${OLD%%.*}" ]; then
+            echo "Major version change ${OLD} -> ${TARGET}; skipping auto-bump (bump the manifest by hand)."
             exit 0
           fi
-          sed -i -E "s#(ghcr.io/antonsatt/mattermost-arm64:).*#\1${VERSION}#" "$FILE"
+          # The weekly run only moves forward. A manual run may roll back on purpose.
+          if [ -z "$INPUT_VERSION" ] && [ "$(printf '%s\n' "$OLD" "$TARGET" | sort -V | tail -1)" != "$TARGET" ]; then
+            echo "Deployed ${OLD} is newer than ${TARGET}; not downgrading."
+            exit 0
+          fi
+          sed -i -E "s#(ghcr.io/antonsatt/mattermost-arm64:).*#\1${TARGET}#" "$FILE"
           if git diff --quiet; then
-            echo "Manifest already at ${VERSION}; nothing to commit."
+            echo "Manifest already at ${TARGET}; nothing to commit."
+            echo "- **Deploy:** manifest already at ${TARGET}" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           git config user.name  "mattermost-arm64-bot"
           git config user.email "bot@antonsatt.com"
-          git commit -am "chore(mattermost): bump to ${VERSION}"
+          git commit -am "chore(mattermost): bump to ${TARGET}"
           git push
-          echo "- **Deployed:** bumped infra manifest ${OLD} -> ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Deployed:** bumped infra manifest ${OLD} -> ${TARGET}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the weekly schedule alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GitHub disables scheduled workflows after 60 days without commits,
+          # which silently stopped this build in November 2026. Re-enable it
+          # through the API on every run (the keepalive-workflow API approach).
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/enable"
+          echo "Workflow re-enabled"
